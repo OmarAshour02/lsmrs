@@ -1,0 +1,11 @@
+[package]
+name = "lsmrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+crc32fast = "1"
+rustyline = "18.0.0"
+thiserror = "2.0.18"
+log = "0.4"
