@@ -1,13 +1,11 @@
 use anyhow::Result;
 use lsmrs::Db;
 use lsmrs::cli::{Command, execute, parse};
-use lsmrs::config::Config;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 fn main() -> Result<()> {
-    let config = Config::default();
-    let mut db = Db::open(config.path.as_str(), config.sync)?;
+    let mut db = Db::open()?;
     let mut rl = DefaultEditor::new()?;
 
     loop {
