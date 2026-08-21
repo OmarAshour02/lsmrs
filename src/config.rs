@@ -1,5 +1,6 @@
+use std::path::PathBuf;
 pub struct Config {
-    pub path: String,
+    pub path: PathBuf,
     pub sync: bool,
     pub table_size: usize,
 }
@@ -7,7 +8,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            path: "data".to_string(),
+            path: PathBuf::from("data"),
             sync: true,
             table_size: 4096 * 1024,
         }

@@ -46,18 +46,18 @@ pub fn parse(line: &str) -> Result<Command> {
 }
 pub fn execute(db: &mut Db, cmd: Command) -> Result<Option<String>> {
     match cmd {
-        Command::Get(key) => match db.get(&key) {
+        Command::Get(key) => match db.get(&key)? {
             Some(v) => Ok(Some(String::from_utf8_lossy(&v).to_string())),
             None => Ok(Some("(not found)".to_string())),
         },
         Command::Put(key, val) => {
-            let _x = db.put(key, val);
+            db.put(key, val)?;
             Ok(Some("OK".to_string()))
         }
-        Command::Del(key) => match db.delete(&key) {
-            Ok(_) => Ok(Some("OK".to_string())),
-            Err(_) => Ok(Some("(not found)".to_string())),
-        },
+        Command::Del(key) => {
+            db.delete(&key)?;
+            Ok(Some("OK".to_string()))
+        }
         Command::Scan => {
             let output: Vec<String> = db
                 .scan()

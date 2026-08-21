@@ -1,4 +1,5 @@
 use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
 const CRC_SIZE: u32 = 4;
 
 #[derive(Debug)]
@@ -44,7 +45,7 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub fn open(path: &str, sync: bool) -> Result<Self, std::io::Error> {
+    pub fn open(path: &PathBuf, sync: bool) -> Result<Self, std::io::Error> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .append(true)
@@ -119,6 +120,11 @@ impl Wal {
         })
     }
 
+    pub fn truncate(&mut self) -> Result<(), std::io::Error> {
+        self.file.set_len(0)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
     pub fn read(&mut self) -> Result<Vec<Record>, std::io::Error> {
         self.file.seek(std::io::SeekFrom::Start(0))?;
         let mut records = Vec::new();
@@ -169,12 +175,9 @@ mod tests {
 
     // Each test gets its own WAL file so they don't clobber each other or the
     // real `wal` in the project root.
-    fn temp_path() -> String {
+    fn temp_path() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir()
-            .join(format!("lsmrs_wal_test_{}_{}", std::process::id(), n))
-            .to_string_lossy()
-            .into_owned()
+        std::env::temp_dir().join(format!("lsmrs_wal_test_{}_{}", std::process::id(), n))
     }
 
     #[test]
