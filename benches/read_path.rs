@@ -21,6 +21,7 @@ fn config(path: PathBuf) -> Config {
         path,
         sync: false,
         table_size: TABLE_SIZE,
+        bits_per_key: 10,
     }
 }
 

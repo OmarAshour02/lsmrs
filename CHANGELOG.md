@@ -5,6 +5,28 @@ All notable changes to lsmrs are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Phase 4 — Bloom Filters
+
+- Per-SSTable bloom filter, built at flush and loaded into memory on open.
+  Sized from the exact key count: `m = n * bits_per_key`,
+  `k = round(ln2 * bits_per_key)`, with `Config { bits_per_key }` defaulting
+  to 10 (measured 0.85% false positives).
+- `m` and `k` are serialized with the filter rather than recomputed from
+  config, so changing `bits_per_key` cannot invalidate existing files.
+- Tombstones are inserted into the filter alongside live keys; skipping them
+  would let a newer table's delete go unseen and resurrect an old value.
+- New `hash::hash64` — FNV-1a plus a MurmurHash3 finalizer, pinned by
+  golden-value tests. `std`'s `DefaultHasher` is unusable here because its
+  algorithm may change between Rust releases.
+- Probe positions use Kirsch-Mitzenmacher double hashing: one hash per lookup,
+  split into a start and a stride, rather than `k` independent hashes. The
+  hash is computed once in `SSTableSet::get` and reused across every table.
+- SSTable format v1: `[data][index][filter][meta][trailer]`. The trailer grows
+  to 32 bytes — three block offsets, a `LSMRS\0` magic, and a version byte, so
+  a format change fails loudly instead of reading garbage as offsets.
+- Reads: misses 20-52x faster, hits in overlapping tables 9.4x faster
+  (see NOTES.md for the full table). Writes unchanged.
+
 ### Phase 3 — Memtable → SSTable Flush
 
 - Memtable flushes to an immutable SSTable once `Config { table_size }` is

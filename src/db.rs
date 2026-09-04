@@ -35,7 +35,7 @@ impl Db {
             }
         }
 
-        let sstable_set = SSTableSet::open(config.path.clone())?;
+        let sstable_set = SSTableSet::open(config.path.clone(), config.bits_per_key)?;
 
         Ok(Self {
             map,
@@ -108,6 +108,7 @@ mod tests {
             path,
             sync: false,
             table_size,
+            bits_per_key: Config::default().bits_per_key,
         }
     }
 
