@@ -156,3 +156,126 @@ filter and not measurement drift.
 The 52x is against an unusually bad baseline: no block cache, and
 `SSTable::get` opens the file with a fresh `File::open` on every lookup. A store
 that kept file handles or cached blocks would show a smaller multiple.
+
+## Phase 5 — Compaction
+
+### The lock protects the list, not the files
+
+SSTables are immutable, so two threads reading the same file is not a race and
+needs no coordination at all. The compactor never touches its inputs -- it reads
+them and writes a new file. The only shared mutable state is *which files exist*,
+which is a `Vec` of a dozen pointers.
+
+So the write lock is held for a pointer swap, not for the merge:
+
+```
+snapshot()          locked, one refcount bump
+merge(...)          unlocked -- the slow part
+write_table(...)    unlocked -- writes the output file
+replace_tables()    locked, pointer swap
+remove_file(...)    unlocked
+```
+
+A design that excluded readers during compaction would have been correct and
+roughly 1000x worse on tail latency: reads are ~4 us, a merge is tens of ms.
+
+### `unlink` is what makes deletion safe
+
+Deleting an SSTable while a reader is mid-scan is fine on POSIX. `unlink`
+removes a *directory entry* and decrements the inode's link count; the inode and
+its blocks survive until the last open descriptor closes. A reader that opened
+the file before the swap keeps reading it, intact, through a file that no longer
+has a name.
+
+This is why `SSTable` now holds its `File` open from `open()` onward rather than
+calling `File::open` per lookup. Two payoffs from one change: hits got ~1.5x
+faster, and deletion needs no reader coordination.
+
+It also forced `read_exact_at` (`pread`) over `Read + Seek`. `read_at` takes
+`&self`, because the offset is an argument rather than shared cursor state --
+so any number of threads can read one descriptor with no lock. `Read`/`Seek`
+take `&mut self` and would have forced a `Mutex<File>`, serialising every
+reader. The concurrency design depended on picking the right I/O API.
+
+### `RwLock<Arc<Vec<T>>>` beats `RwLock<Vec<T>>`
+
+First attempt was `Arc<RwLock<Vec<Arc<SSTable>>>>`, where a reader clones the
+`Vec` to get a snapshot. That regressed `get_miss` from 241ns to 434ns -- one
+heap allocation plus a refcount bump per table, on every single read.
+
+`Arc<RwLock<Arc<Vec<Arc<SSTable>>>>>` fixed it: the reader clones one `Arc`, a
+single atomic increment, no allocation. The `Vec` is immutable once published;
+a writer builds a fresh one and swaps the pointer. Cost moves to the writer,
+which clones a 13-element `Vec` per flush -- the right trade when reads are
+constant and flushes are rare.
+
+This is the shape of RCU, and the lesson generalises: when readers vastly
+outnumber writers, make the shared thing immutable and swap pointers.
+
+### Crash recovery without a MANIFEST
+
+Filenames carry the span of flushes a table contains --
+`sstable-000002-000003.sst` is the merge of flushes 2 and 3. Two properties fall
+out:
+
+- **Ordering survives compaction.** Sorting by the first number keeps the merge
+  where its inputs were, instead of letting it sort last and shadow newer data.
+- **Leftovers identify themselves.** After a crash between "publish the output"
+  and "delete the inputs", any file whose span is contained in another's is an
+  orphan. `[2,2]` and `[3,3]` are inside `[2,3]`, so they go.
+
+That second rule is only sound because of atomic publish: write to `.tmp`,
+fsync, `rename`, fsync the directory. A file under its final name is therefore
+always complete, so its presence is proof the merge finished. Without the
+rename, a half-written merge would appear and recovery would delete the two good
+inputs in its favour.
+
+Cost: puts went from 3.14us to ~4.0us, all of it the directory fsync per flush.
+
+### Tombstones can only be dropped by the oldest merge
+
+Compaction reclaims space by discarding overwritten values and deleted keys.
+Overwrites are free -- the newest wins and the rest vanish. Tombstones are not:
+dropping one while an older table still holds the key resurrects the value.
+
+So a merge may drop tombstones only when no live table is older than its inputs.
+Third appearance of the same bug class this project, after "tombstones must go
+in the bloom filter" and "a merge must not sort as newest": *an old value
+becoming reachable again*.
+
+### Shutdown is the absence of senders
+
+`rx.recv()` returns `Err` once every `Sender` has dropped, so the compactor's
+loop is just `while rx.recv().is_ok()`. No stop flag, no `AtomicBool`, no
+poison message -- dropping the sender *is* the signal. `Db::drop` takes the
+sender, drops it, then `join`s.
+
+The `Option<Sender>` / `Option<JoinHandle>` fields exist because `Drop::drop`
+gets `&mut self`, and both dropping a sender and joining a handle need to
+*consume* the value. `Option::take` is the standard way out.
+
+A pleasant side effect: `Drop` joining the compactor makes the background thread
+*testable*. A test writes 20 tables, drops the `Db`, and by the time the scope
+ends every triggered compaction has finished -- deterministic, no sleeps.
+
+### Benchmark after compaction
+
+| benchmark | Phase 4 | after Phase 5 |
+|---|---|---|
+| `read_path/get_miss` | 250 ns | 221 ns |
+| `read_path/get_hit` | 6.06 us | 4.14 us |
+| `read_path_overlapping/get_miss` | 1.22 us | 548 ns |
+| `read_path_overlapping/get_hit` | 7.13 us | 4.94 us |
+| `put` | 3.14 us | 3.96 us |
+
+Hits gained from holding descriptors open. The overlapping miss halved again
+because compaction cut the number of tables a lookup must probe. Puts pay the
+directory fsync.
+
+### Known limitation
+
+`merge` materialises its whole output in a `Vec` before writing, because
+`write_table` needs the key count up front to size the bloom filter. Inputs
+stream; the output does not. Fine at 4MB tables, not at 400MB. The fix is a v2
+format storing key count in the metadata block, so the sum of inputs gives an
+upper bound.

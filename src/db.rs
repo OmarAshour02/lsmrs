@@ -4,13 +4,18 @@ use crate::wal::{Operation, Wal};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
+use std::thread::JoinHandle;
 
 pub struct Db {
     map: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     wal: Wal,
     size: usize,
     config: Config,
-    sstable_set: SSTableSet,
+    sstable_set: Arc<SSTableSet>,
+    flush_tx: Option<Sender<()>>,
+    compactor: Option<JoinHandle<()>>,
 }
 
 impl Db {
@@ -35,7 +40,25 @@ impl Db {
             }
         }
 
-        let sstable_set = SSTableSet::open(config.path.clone(), config.bits_per_key)?;
+        let sstable_set = Arc::new(SSTableSet::open(config.path.clone(), config.bits_per_key)?);
+
+        let (flush_tx, flush_rx) = mpsc::channel::<()>();
+        let tables = Arc::clone(&sstable_set);
+        let min_run = config.compaction_threshold;
+        let size_ratio = config.compaction_size_ratio;
+
+        // `recv` parks the thread until a flush rings, and returns `Err` once
+        // every sender is gone -- which is how `Drop` asks it to stop.
+        let compactor = std::thread::spawn(move || {
+            while flush_rx.recv().is_ok() {
+                while let Some((start, count)) = tables.pick_run(min_run, size_ratio) {
+                    if let Err(e) = tables.compact(start, count) {
+                        eprintln!("lsmrs: compaction failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             map,
@@ -43,6 +66,8 @@ impl Db {
             size: 0,
             config,
             sstable_set,
+            flush_tx: Some(flush_tx),
+            compactor: Some(compactor),
         })
     }
 
@@ -50,6 +75,12 @@ impl Db {
         self.sstable_set.write(&self.map)?;
         self.map.clear();
         self.wal.truncate()?;
+
+        // A dead compactor is not a failed write: the tables are correct, just
+        // not yet merged.
+        if let Some(tx) = &self.flush_tx {
+            let _ = tx.send(());
+        }
         Ok(())
     }
 
@@ -90,6 +121,15 @@ impl Db {
     }
 }
 
+impl Drop for Db {
+    fn drop(&mut self) {
+        self.flush_tx.take();
+        if let Some(compactor) = self.compactor.take() {
+            let _ = compactor.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,7 +148,7 @@ mod tests {
             path,
             sync: false,
             table_size,
-            bits_per_key: Config::default().bits_per_key,
+            ..Config::default()
         }
     }
 
@@ -119,6 +159,78 @@ mod tests {
     // A threshold of 0 makes every put after the first trip the flush check, so
     // the SSTable paths are exercised without writing megabytes.
     const FLUSH_EVERY_PUT: usize = 0;
+
+    fn sst_count(path: &PathBuf) -> usize {
+        std::fs::read_dir(path)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    == Some("sst")
+            })
+            .count()
+    }
+
+    #[test]
+    fn compaction_merges_tables_in_the_background() {
+        let path = temp_path();
+        {
+            let mut db = Db::with_config(config_at(path.clone(), FLUSH_EVERY_PUT)).unwrap();
+            for i in 0..20u32 {
+                db.put(format!("key{i:03}").into_bytes(), vec![b'v'; 32])
+                    .unwrap();
+            }
+            // Dropping joins the compactor, so by the time this scope ends
+            // every compaction triggered by the last flush has finished.
+        }
+
+        assert!(
+            sst_count(&path) < 20,
+            "expected compaction to reduce 20 flushes, found {}",
+            sst_count(&path)
+        );
+
+        let db = Db::with_config(config_at(path, FLUSH_EVERY_PUT)).unwrap();
+        for i in 0..20u32 {
+            assert_eq!(
+                db.get(format!("key{i:03}").as_bytes()).unwrap(),
+                Some(vec![b'v'; 32]),
+                "lost key {i} to compaction"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_survives_overwrites_and_deletes() {
+        let path = temp_path();
+        {
+            let mut db = Db::with_config(config_at(path.clone(), FLUSH_EVERY_PUT)).unwrap();
+            for i in 0..12u32 {
+                db.put(format!("key{i:03}").into_bytes(), b"first".to_vec())
+                    .unwrap();
+            }
+            for i in 0..12u32 {
+                if i % 3 == 0 {
+                    db.delete(format!("key{i:03}").as_bytes()).unwrap();
+                } else {
+                    db.put(format!("key{i:03}").into_bytes(), b"second".to_vec())
+                        .unwrap();
+                }
+            }
+        }
+
+        let db = Db::with_config(config_at(path, FLUSH_EVERY_PUT)).unwrap();
+        for i in 0..12u32 {
+            let expected = match i % 3 {
+                0 => None,
+                _ => Some(b"second".to_vec()),
+            };
+            assert_eq!(db.get(format!("key{i:03}").as_bytes()).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn put_then_get_returns_value() {

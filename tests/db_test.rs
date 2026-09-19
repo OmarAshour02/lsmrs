@@ -14,7 +14,7 @@ fn config_at(path: PathBuf, table_size: usize) -> Config {
         path,
         sync: false,
         table_size,
-        bits_per_key: 10,
+        ..Config::default()
     }
 }
 

@@ -5,6 +5,35 @@ All notable changes to lsmrs are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Phase 5 — Compaction
+
+- Background compactor thread, woken by an `mpsc` channel after each flush and
+  stopped by the `Sender` dropping. `Db::drop` joins it, which also makes the
+  thread deterministic to test.
+- Size-tiered selection: `pick_run` groups tables whose sizes are within
+  `Config { compaction_size_ratio }` and merges once
+  `Config { compaction_threshold }` of them accumulate (defaults 1.5 and 4), so
+  a small flush is never rewritten into a large table.
+- Reads are never blocked by a merge. `SSTableSet` holds
+  `Arc<RwLock<Arc<Vec<Arc<SSTable>>>>>`; a reader clones one `Arc` under the
+  read lock and does all I/O unlocked, while the compactor merges outside the
+  lock and takes the write lock only to swap the pointer.
+- `SSTable` keeps its `File` open and reads through `read_exact_at` (`pread`),
+  which takes `&self` — so many threads share one descriptor with no `Mutex`.
+  Deleting a compacted file under a live reader is safe: `unlink` drops the
+  name, the inode outlives it until the last descriptor closes.
+- SSTables are named `sstable-{first}-{last}.sst`, recording the span of
+  flushes they contain. Sorting by the first number keeps a merge in its
+  inputs' position instead of letting it shadow newer data, and any file whose
+  span is contained in another's is a crash leftover, deleted on open. No
+  MANIFEST needed.
+- Every table is now published atomically: written to `.tmp`, fsynced, renamed,
+  and the directory fsynced. A file under its final name is always complete.
+- Tombstones are dropped only when the merge includes the oldest live table;
+  anywhere else they are carried forward, or an older value resurfaces.
+- Reads after compaction: overlapping misses 1.22µs → 548ns, hits 7.13µs →
+  4.94µs. Puts 3.14µs → 3.96µs, all of it the directory fsync.
+
 ### Phase 4 — Bloom Filters
 
 - Per-SSTable bloom filter, built at flush and loaded into memory on open.
