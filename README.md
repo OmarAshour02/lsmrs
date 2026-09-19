@@ -1,8 +1,7 @@
 # lsmrs
 
 A learning project: an LSM-tree key-value store built from scratch in Rust —
-WAL, SSTables, bloom filters, and compaction. No storage-engine crates, and
-**0 LOC of code written by coding agents** — every line is hand-written.
+WAL, SSTables, bloom filters, and compaction. No storage-engine crates used.
 
 The goal isn't to ship a database; it's to understand how one works by building
 the layers a real LSM engine (LevelDB, RocksDB) is made of, one at a time.
