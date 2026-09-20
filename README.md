@@ -8,17 +8,31 @@ the layers a real LSM engine (LevelDB, RocksDB) is made of, one at a time.
 Architecture follows *Designing Data-Intensive Applications*, 2nd ed., Ch. 4
 (Storage and Retrieval).
 
-> **Status:** Phase 2 of 7 complete. The in-memory store, CLI, and the
-> write-ahead log (with crash recovery) work today. SSTables, bloom filters,
-> compaction, and the network layer are still ahead — see [Build Phases](#build-phases).
+> **Status:** all 7 phases complete. WAL with crash recovery, SSTables with
+> sparse indexes and bloom filters, background size-tiered compaction, and a
+> Redis-protocol server you can drive with `redis-cli`.
 
 ---
 
 ## Quick start
 
 ```bash
-cargo run            # start the REPL
+cargo run                       # REPL
+cargo run --release -- serve    # Redis-protocol server on 127.0.0.1:6379
 ```
+
+```bash
+$ redis-cli -p 6379 SET greeting "hello from lsmrs"
+OK
+$ redis-cli -p 6379 GET greeting
+"hello from lsmrs"
+$ redis-cli -p 6379 DEL greeting
+(integer) 1
+```
+
+Supported commands: `PING`, `ECHO`, `GET`, `SET`, `DEL`, `QUIT`.
+
+### REPL
 
 ```text
 lsmrs> PUT foo bar
@@ -124,16 +138,55 @@ the next begins.
       `thiserror` errors.
 - [x] **Phase 2 — Write-ahead log:** binary record format, CRC validation,
       replay on startup, configurable `fsync`, torn-write recovery.
-- [ ] **Phase 3 — Memtable → SSTable flush:** sorted data blocks, sparse index,
+- [x] **Phase 3 — Memtable → SSTable flush:** sorted data blocks, sparse index,
       footer; layered reads; WAL truncation after flush.
-- [ ] **Phase 4 — Bloom filters + block index:** per-SSTable bloom filter,
+- [x] **Phase 4 — Bloom filters + block index:** per-SSTable bloom filter,
       binary search on the sparse index, before/after benchmarks.
-- [ ] **Phase 5 — Compaction:** background size-tiered merge, tombstone cleanup,
+- [x] **Phase 5 — Compaction:** background size-tiered merge, tombstone cleanup,
       `Arc<RwLock>` coordination, no stop-the-world.
-- [ ] **Phase 6 — Network protocol:** TCP server speaking a Redis RESP subset,
+- [x] **Phase 6 — Network protocol:** TCP server speaking a Redis RESP subset,
       usable from `redis-cli`.
-- [ ] **Phase 7 — Polish & benchmark:** YCSB-style workload, latency histograms
+- [x] **Phase 7 — Polish & benchmark:** YCSB-style workload, latency histograms
       (p50/p95/p99), comparison notes.
+
+---
+
+## Benchmarks
+
+Bloom filters, measured against the phase-3 read path (10k keys, ~13 SSTables):
+
+| operation | before | after |
+|---|---|---|
+| miss, overlapping key ranges | 63.9 µs | 1.22 µs |
+| miss, disjoint ranges | 5.13 µs | 250 ns |
+
+YCSB-style, 20k records / 40k operations / 8 threads / Zipfian keys, against a
+real `redis-server` on the same 16-core machine:
+
+| server | durability | ops/sec | read p50 | read p99.9 |
+|---|---|---|---|---|
+| lsmrs | fsync per write | 4,011 | 2031 µs | 12689 µs |
+| redis | `appendfsync always` | 9,427 | 876 µs | 3697 µs |
+| lsmrs | none | 172,971 | 30 µs | 358 µs |
+| redis | no AOF | 123,934 | 60 µs | 178 µs |
+
+Three things worth reading off that table:
+
+- **fsync costs 43x.** Nothing else in this project comes close to that factor.
+- **Redis wins at equal durability**, while single-threaded, because it
+  *group-commits*: N concurrent writers share one disk round-trip. lsmrs fsyncs
+  per write under a global lock, so N writers cost N fsyncs. That is the
+  single largest piece of known work left.
+- **Redis has tighter tails** — no lock contention, no background compaction.
+  The LSM design trades tail latency for write throughput, and this is that
+  trade, measured.
+
+Reproduce with:
+
+```bash
+cargo run --release -- serve 127.0.0.1:7379 --no-sync
+cargo run --release --bin ycsb -- --addr 127.0.0.1:7379 --workload a
+```
 
 ---
 
@@ -141,17 +194,28 @@ the next begins.
 
 ```
 src/
-├── main.rs      # CLI binary, rustyline REPL
-├── lib.rs       # re-exports
-├── db.rs        # Db: memtable + WAL coordination, get/put/delete/scan
-├── wal.rs       # write-ahead log: record format, append, replay
-├── config.rs    # Config (path, sync)
-├── error.rs     # DbError
-└── cli/
-    └── mod.rs   # command parsing + execution
+├── main.rs        # REPL and `serve` entry point
+├── lib.rs         # re-exports
+├── db.rs          # Db: memtable, WAL, flush, compactor thread
+├── wal.rs         # write-ahead log: record format, append, replay
+├── sstable.rs     # SSTable format, read path, merge, compaction
+├── bloom.rs       # bit array, probe walk
+├── hash.rs        # FNV-1a + MurmurHash3 finalizer, pinned by golden tests
+├── resp.rs        # RESP2 parsing and reply encoding
+├── server.rs      # TCP listener, command dispatch, shutdown
+├── config.rs      # Config
+├── error.rs       # DbError
+├── cli/mod.rs     # REPL command parsing
+└── bin/ycsb.rs    # YCSB-style load generator
 tests/
-└── db_test.rs   # integration tests against the public API
+├── db_test.rs     # integration tests against the public API
+└── server_test.rs # integration tests over a real socket
+benches/
+└── read_path.rs   # criterion benchmarks
 ```
+
+For the reasoning behind each phase see [`DESIGN.md`](DESIGN.md); for the
+things learned along the way, [`NOTES.md`](NOTES.md).
 
 ---
 

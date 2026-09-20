@@ -4,6 +4,8 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod hash;
+pub mod resp;
+pub mod server;
 pub mod sstable;
 pub mod wal;
 pub use db::Db;

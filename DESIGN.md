@@ -76,3 +76,114 @@ but is slow (waits on the device). So durability is a per-`Db` choice via
 ### Deferred
 
 - *Truncate WAL after SSTable flush* — depends on SSTables; lands in Phase 3.
+
+---
+
+## Phase 3 — Memtable → SSTable Flush
+
+- **Immutable files.** An SSTable is written once and never modified. Every
+  later design choice depends on this: readers need no locks against writers,
+  compaction can read inputs while serving traffic, and a merge can publish its
+  output before deleting what it consumed.
+- **Sparse index, not a full one.** One index entry per 4KB block rather than
+  per key. A lookup binary-searches the index for the block a key *would* be in,
+  then scans forward inside it. Trades a bounded scan for an index small enough
+  to keep in memory.
+- **Tombstones are records.** A delete writes a record with `op_type = 1` and an
+  empty value. It cannot be inferred from an empty value, because an empty
+  *value* is legal — one byte separates "deleted" from "set to nothing".
+- **Read order is newest-first** across tables, stopping at the first answer. A
+  tombstone in a newer table is an answer: it means "absent", not "keep looking".
+
+## Phase 4 — Bloom Filters
+
+- **The filter is per-table and lives in the file.** `m` and `k` are serialized
+  alongside the bits rather than recomputed from `Config`, so changing the
+  config knob later cannot silently mis-read files already on disk. Config is
+  write-time policy; the parameters are properties of the bytes.
+- **Sized from the exact key count.** At flush time `memtable.len()` is known,
+  so `m = n * bits_per_key` and `k = round(ln2 * bits_per_key)` are exact rather
+  than estimated. At 10 bits/key the measured false-positive rate is 0.85%
+  against a theoretical 0.82%.
+- **Tombstones go in the filter.** Omitting them would make a newer table's
+  delete invisible, and the read would fall through to an older table and
+  resurrect the value.
+- **A hand-written, pinned hash.** `std`'s `DefaultHasher` is explicitly allowed
+  to change between Rust releases. For anything whose output is persisted, that
+  is silent data loss: filters written by one build, misread by the next. So
+  FNV-1a plus a MurmurHash3 finalizer, with golden-value tests that fail loudly
+  if the algorithm ever moves.
+- **One hash per lookup, not `k`.** Kirsch–Mitzenmacher double hashing: split a
+  single 64-bit hash into a start and a stride, then walk. And the hash is
+  computed once per `get` in `SSTableSet`, not once per table.
+
+## Phase 5 — Compaction
+
+- **The lock protects the list, not the files.** SSTables are immutable, so
+  concurrent readers of one file need no coordination at all. The only shared
+  mutable state is *which files exist*. The merge and the output write happen
+  unlocked; the write lock is held for a pointer swap.
+- **`Arc<RwLock<Arc<Vec<Arc<SSTable>>>>>`.** A reader clones the inner `Arc` —
+  one atomic increment, no allocation — and does all I/O unlocked. The `Vec` is
+  immutable once published; a writer builds a new one and swaps. Putting the
+  `Vec` directly under the lock instead cost a heap allocation per read and
+  measurably regressed the miss path.
+- **Descriptors held open; deletion needs no coordination.** `unlink` removes a
+  name and the inode survives until the last descriptor closes, so a compactor
+  may delete a file a reader is mid-scan on. This requires `read_exact_at`
+  (`pread`), which takes `&self` — `Read + Seek` would have forced a
+  `Mutex<File>` and serialised every reader.
+- **Filenames record spans.** `sstable-{first}-{last}.sst` names the range of
+  flushes a table contains. Sorting by the first number keeps a merge in its
+  inputs' position rather than letting it sort last and shadow newer data, and
+  any span contained in another span is a crash leftover. No MANIFEST needed.
+- **Atomic publish.** Write to `.tmp`, fsync, `rename`, fsync the directory. A
+  file under its final name is complete by construction — which is exactly what
+  makes the span-containment recovery rule sound.
+- **Tombstones only drop in the oldest merge.** Anywhere else, an older table
+  may still hold the value the tombstone is hiding.
+- **Shutdown is the absence of senders.** `recv()` returns `Err` when every
+  `Sender` has dropped, so `Db::drop` takes the sender and joins. No stop flag.
+  A side effect is that background compaction becomes deterministic to test.
+
+## Phase 6 — Network Protocol
+
+- **RESP2 subset over thread-per-connection.** `Db::get` already took `&self`
+  and `put`/`delete` `&mut self`, so `Arc<RwLock<Db>>` maps onto the existing
+  API unchanged: reads concurrent, writes exclusive.
+- **Length prefixes, because the data is arbitrary bytes.** The same reasoning
+  as the SSTable and WAL record formats. A `SET` whose value contains `\r\n` —
+  the protocol's own terminator — round-trips intact.
+- **A length prefix from a socket is an allocation instruction from a
+  stranger.** `MAX_BULK_LEN` is checked before the `vec![0u8; len]`, not after.
+  This is the first untrusted input in the project.
+- **Command errors reply; protocol errors hang up.** An unknown command or bad
+  arity is a normal reply and the connection continues. A malformed frame
+  desynchronises the stream — there is no way to know where the next command
+  begins — so it gets `-ERR Protocol error` and a close.
+- **Shutdown wakes a blocked `accept` by connecting to itself.** A flag alone
+  cannot interrupt `accept`; the self-connection is what lets the loop notice.
+  It also makes the server joinable in tests rather than leaking a thread each.
+
+## Phase 7 — Benchmark
+
+Measured with a YCSB-style generator speaking RESP, so the identical binary
+drives both lsmrs and a real `redis-server`. Full tables in NOTES.md.
+
+- **fsync dominates everything, by 43x.** 4,011 ops/sec with WAL fsync per
+  write, 172,971 without. No in-process optimisation in this project comes
+  within an order of magnitude of that factor.
+- **Redis is 2.3x faster at equal durability, and the reason is group commit.**
+  Redis fsyncs its AOF once per event-loop iteration, so N concurrent writers
+  share one disk round-trip. lsmrs fsyncs inside `put` while holding the global
+  write lock, so N writers cost N serialised fsyncs. This is the single largest
+  piece of known work left.
+- **Where lsmrs is faster, it is arithmetic.** 1.4–1.9x ahead without fsync, on
+  8 threads against Redis's one, on a 16-core box. Per core Redis is well ahead.
+- **Redis has tighter tails, and that is real.** p99.9 of 178µs against 358µs,
+  while being slower at the median. No lock contention and no background
+  compaction. The LSM design trades tail latency for write throughput; this is
+  that trade, measured.
+- **Read-only is 37% faster than the mixed workload**, which is the cost of
+  `RwLock<Db>` serialising writers ahead of readers — the second thing to fix
+  after group commit.

@@ -5,6 +5,40 @@ All notable changes to lsmrs are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Phase 7 — Benchmark
+
+- `src/bin/ycsb.rs`: a YCSB-style load generator speaking RESP, so the same
+  binary drives lsmrs or a real `redis-server`. Workloads A (50/50), B (95/5)
+  and C (read-only), uniform or Zipfian keys, per-operation latency percentiles.
+- `lsmrs serve --no-sync` runs without WAL fsync, for benchmarking against
+  servers at matching durability.
+- Headline numbers (20k records, 40k ops, 8 threads, Zipfian): fsync per write
+  costs 43x — 4,011 ops/sec with it, 172,971 without. Redis at
+  `appendfsync always` is 2.3x faster than lsmrs at equal durability because it
+  group-commits its AOF; lsmrs fsyncs per write under the global lock.
+- Full analysis and the comparison matrix in NOTES.md; per-phase rationale for
+  Phases 3-7 added to DESIGN.md.
+
+### Phase 6 — Network Protocol
+
+- `lsmrs serve [addr]` starts a TCP server speaking a RESP2 subset, so
+  `redis-cli` and other Redis clients work against it unmodified. Default
+  address is `127.0.0.1:6379`.
+- Commands: `PING`, `ECHO`, `GET`, `SET`, `DEL`, `QUIT`, and `COMMAND` (which
+  `redis-cli` sends on connect).
+- `src/resp.rs` parses both RESP arrays and inline commands, and rejects a
+  bulk-string length over 64MB *before* allocating — the first untrusted input
+  in the project.
+- Thread per connection over `Arc<RwLock<Db>>`: reads run concurrently, writes
+  take the exclusive lock. `try_clone` splits the socket so the reader and
+  writer halves can be owned independently.
+- Command errors (unknown name, wrong arity) reply and keep the connection;
+  protocol errors reply and hang up, because a desynchronised stream cannot be
+  resynchronised.
+- Graceful shutdown: `ShutdownHandle::shutdown` sets a flag and connects to the
+  listener's own port to wake the blocked `accept`, which also makes the server
+  joinable in tests.
+
 ### Phase 5 — Compaction
 
 - Background compactor thread, woken by an `mpsc` channel after each flush and

@@ -138,7 +138,7 @@ impl Wal {
             }
             let length = u32::from_le_bytes(length_bytes);
             let mut checksum_bytes = [0u8; 4];
-            if length < CRC_SIZE as u32 {
+            if length < CRC_SIZE {
                 break;
             }
             match reader.read_exact(&mut checksum_bytes) {

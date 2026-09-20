@@ -279,3 +279,147 @@ directory fsync.
 stream; the output does not. Fine at 4MB tables, not at 400MB. The fix is a v2
 format storing key count in the metadata block, so the sum of inputs gives an
 upper bound.
+
+## Phase 6 — Network Protocol
+
+### A length prefix is an allocation instruction from a stranger
+
+Every phase before this one parsed bytes it had written itself. A socket does
+not: `$999999999\r\n` is a client asking the server to allocate a gigabyte
+before a single byte of payload arrives. Hence `MAX_BULK_LEN`, checked *before*
+`vec![0u8; len]`, and a test named after the ordering.
+
+This is the first untrusted input in the project, and it is a different failure
+class from anything the storage engine handles.
+
+### Why RESP is length-prefixed and not delimited
+
+`SET binary "a\r\nb"` works -- a value containing the protocol's own terminator
+survives, because the bulk string says how many bytes to read instead of
+scanning for a marker. Exactly the reasoning behind the SSTable record format
+in Phase 3, arrived at independently by Redis for the same reason: the data is
+arbitrary bytes and no byte can be reserved.
+
+Inline commands (`GET key\r\n`, what netcat sends) are the exception and are
+*not* binary safe. That is fine because they exist for humans.
+
+### `Arc<RwLock<Db>>` and the write bottleneck
+
+`Db::get` takes `&self` and `put`/`delete` take `&mut self`, so `RwLock` maps
+onto the existing API with no changes: reads run concurrently, writes serialise.
+
+Worth being honest that this is a real ceiling. Every `SET` in the process takes
+one global exclusive lock, so write throughput does not scale with cores no
+matter how many connection threads exist. Redis reaches the same place by a
+different route (a single thread). Fixing it properly means sharding the
+memtable or making the WAL append lock-free -- well past this project.
+
+### `try_clone` is `dup(2)`
+
+`BufReader::new(stream)` takes ownership of the socket, but the connection also
+needs to write. `stream.try_clone()` returns a second `TcpStream` referring to
+the same underlying descriptor -- `dup(2)` -- so the reader and writer halves
+can be owned independently. Closing one does not close the connection; the
+socket dies when the last handle drops.
+
+### Waking a blocked `accept`
+
+`TcpListener::accept` blocks, so an `AtomicBool` alone cannot stop the loop --
+the flag is only checked between accepts, and there is no next accept until
+someone connects.
+
+The fix is to connect to our own port:
+
+```rust
+pub fn shutdown(&self) {
+    self.flag.store(true, Ordering::Relaxed);
+    let _ = TcpStream::connect(self.addr);
+}
+```
+
+Slightly grubby, entirely standard, and it makes the server testable -- the test
+harness can stop the accept thread and `join` it instead of leaking one per
+test. The alternative is non-blocking sockets plus a poll loop, which is more
+machinery for the same result at this scale.
+
+### Protocol errors close the connection
+
+A malformed frame desynchronises the stream: there is no way to know where the
+next command starts. So a protocol error gets `-ERR Protocol error: ...` and a
+hang-up, while a *command* error (unknown name, wrong arity) is just a reply and
+the connection continues. Redis draws the line in the same place, and the
+distinction is the difference between "you said something I don't understand"
+and "I no longer know where your sentences begin."
+
+## Phase 7 — Benchmark
+
+YCSB-style load generator (`src/bin/ycsb.rs`) speaking RESP, so the same binary
+points at lsmrs or at a real `redis-server`. Zipfian key distribution
+(theta 0.99, scrambled through `hash64`), 20k records, 40k operations,
+8 client threads, 16-core machine.
+
+Workload A is 50% read / 50% update; workload C is read-only.
+
+| server | durability | workload | ops/sec | read p50 | read p99 | read p99.9 |
+|---|---|---|---|---|---|---|
+| lsmrs | fsync per write | A | 4,011 | 2031 us | 8651 us | 12689 us |
+| redis | `appendfsync always` | A | 9,427 | 876 us | 1722 us | 3697 us |
+| lsmrs | none | A | 172,971 | 30 us | 118 us | 358 us |
+| redis | no AOF | A | 123,934 | 60 us | 117 us | 178 us |
+| lsmrs | none | C | 237,260 | 25 us | 92 us | 314 us |
+| redis | no AOF | C | 126,450 | 59 us | 106 us | 174 us |
+
+### fsync is the whole story, 43x of it
+
+Turning off WAL fsync takes lsmrs from 4,011 to 172,971 ops/sec. Nothing else
+measured in this project comes close to that factor -- bloom filters were 20-52x
+on a miss path that was itself microseconds. A single disk round-trip per write
+dwarfs every in-process optimisation.
+
+It is also why the earlier phase benchmarks used `sync: false`: with fsync on,
+they would have measured the disk and nothing else.
+
+### Redis is 2.3x faster at equal durability, and the reason is a real gap
+
+`appendfsync always` is Redis's comparable setting, and it beats us 9,427 to
+4,011. Redis is *single-threaded* and still wins, so this is not about cores.
+
+The difference is **group commit**. Redis appends every command to its AOF
+buffer and fsyncs once per event-loop iteration, so eight clients writing
+concurrently cost one fsync between them. lsmrs fsyncs inside `put`, while
+holding the global write lock, so eight concurrent writers produce eight
+serialised fsyncs. Our durable write path is as slow as the disk *times the
+number of writers*; Redis's is the disk *divided among* them.
+
+This is the clearest concrete thing left undone in the project. Fixing it means
+a commit queue: writers append to a shared buffer, one designated writer fsyncs
+the batch, everyone waiting on that batch is woken. It is the standard design
+and it is what every real WAL does.
+
+### Where lsmrs wins, and why it doesn't count for much
+
+Without fsync we beat Redis 1.4x on the mixed workload and 1.9x read-only. That
+is 8 client threads on 16 cores against Redis's single thread. Per core, Redis
+is several times ahead. A thread-per-connection server outrunning a
+single-threaded one on a 16-core box is arithmetic, not engineering.
+
+### Redis has better tails, and that is engineering
+
+At p99.9 on workload A without fsync: Redis 178us, lsmrs 358us. Redis is
+*tighter* while being slower at the median. Two reasons, both structural:
+
+- **No lock contention.** One thread means no writer ever waits for a reader.
+  Our `RwLock<Db>` serialises every `SET` globally, so a write arriving behind
+  seven others waits for all of them.
+- **No background compaction.** Our compactor competes for disk and CPU with
+  live traffic and takes the write lock to publish. Redis has no equivalent.
+
+The LSM design trades tail latency for write throughput. This is that trade,
+measured.
+
+### What the read-only number says
+
+237k ops/sec on workload C, against 173k on A, isolates the write lock: removing
+writes entirely is worth 37%. That gap is the cost of `RwLock<Db>` -- readers
+queueing behind exclusive writers -- and it is the second thing worth fixing
+after group commit.
