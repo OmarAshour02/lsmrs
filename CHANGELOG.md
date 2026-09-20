@@ -5,6 +5,18 @@ All notable changes to lsmrs are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Fixes
+
+- `default-run = "lsmrs"` in `Cargo.toml`. Adding the `ycsb` binary in Phase 7
+  made a bare `cargo run` ambiguous.
+- `Db::with_config` now reports `<path> exists but is not a directory` instead
+  of letting `create_dir_all` surface a bare `File exists (os error 17)`.
+- Benchmark numbers re-measured with all six configurations run back to back.
+  An earlier claim that Redis has structurally tighter tails does not survive
+  that: unsynced, p99.9 is 183µs vs 170µs and lsmrs is ahead at p99. Redis's
+  tail advantage is real only with fsync, where group commit bounds how long a
+  writer waits. Noted in NOTES.md.
+
 ### Phase 7 — Benchmark
 
 - `src/bin/ycsb.rs`: a YCSB-style load generator speaking RESP, so the same

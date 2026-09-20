@@ -24,6 +24,17 @@ impl Db {
     }
 
     pub fn with_config(config: Config) -> Result<Self, io::Error> {
+        // `create_dir_all` reports a bare EEXIST when the path is a regular
+        // file, which says nothing about which path or why.
+        if config.path.exists() && !config.path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists but is not a directory -- lsmrs needs a directory for its data",
+                    config.path.display()
+                ),
+            ));
+        }
         std::fs::create_dir_all(&config.path)?;
 
         let mut wal = Wal::open(&config.path.join("wal.log"), config.sync)?;
@@ -172,6 +183,18 @@ mod tests {
                     == Some("sst")
             })
             .count()
+    }
+
+    #[test]
+    fn a_file_where_the_data_directory_belongs_is_reported_clearly() {
+        let path = temp_path();
+        std::fs::write(&path, b"a leftover from an earlier layout").unwrap();
+
+        let err = Db::with_config(config_at(path, FLUSH_EVERY_PUT))
+            .err()
+            .expect("opening onto a regular file should fail");
+
+        assert!(err.to_string().contains("is not a directory"), "{err}");
     }
 
     #[test]

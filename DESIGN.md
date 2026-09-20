@@ -170,20 +170,20 @@ but is slow (waits on the device). So durability is a per-`Db` choice via
 Measured with a YCSB-style generator speaking RESP, so the identical binary
 drives both lsmrs and a real `redis-server`. Full tables in NOTES.md.
 
-- **fsync dominates everything, by 43x.** 4,011 ops/sec with WAL fsync per
-  write, 172,971 without. No in-process optimisation in this project comes
+- **fsync dominates everything, by 45x.** 4,194 ops/sec with WAL fsync per
+  write, 187,362 without. No in-process optimisation in this project comes
   within an order of magnitude of that factor.
-- **Redis is 2.3x faster at equal durability, and the reason is group commit.**
+- **Redis is 2.1x faster at equal durability, and the reason is group commit.**
   Redis fsyncs its AOF once per event-loop iteration, so N concurrent writers
   share one disk round-trip. lsmrs fsyncs inside `put` while holding the global
   write lock, so N writers cost N serialised fsyncs. This is the single largest
   piece of known work left.
-- **Where lsmrs is faster, it is arithmetic.** 1.4–1.9x ahead without fsync, on
+- **Where lsmrs is faster, it is arithmetic.** 1.5–2.1x ahead without fsync, on
   8 threads against Redis's one, on a 16-core box. Per core Redis is well ahead.
-- **Redis has tighter tails, and that is real.** p99.9 of 178µs against 358µs,
-  while being slower at the median. No lock contention and no background
-  compaction. The LSM design trades tail latency for write throughput; this is
-  that trade, measured.
-- **Read-only is 37% faster than the mixed workload**, which is the cost of
+- **Tails are close without fsync and far apart with it.** 183µs vs 170µs at
+  p99.9 unsynced; 13124µs vs 5150µs synced. Group commit again: it bounds how
+  long a writer can be stuck behind other writers, where fsync-under-a-global-
+  lock does not.
+- **Read-only is 44% faster than the mixed workload**, which is the cost of
   `RwLock<Db>` serialising writers ahead of readers — the second thing to fix
   after group commit.

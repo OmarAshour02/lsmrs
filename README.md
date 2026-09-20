@@ -14,6 +14,62 @@ Architecture follows *Designing Data-Intensive Applications*, 2nd ed., Ch. 4
 
 ---
 
+## Benchmarks
+
+20k records, 40k operations, 8 client threads, Zipfian keys (theta 0.99).
+lsmrs against Redis 7.0.15 on the same machine — i7-13620H, 16 threads,
+Linux 6.17, rustc 1.97. Workload A is 50% read / 50% update; C is read-only.
+
+| Workload | Durability | Server | ops/sec | read p50 | read p99 | read p99.9 |
+|---|---|---|---:|---:|---:|---:|
+| A | fsync per write | lsmrs | 4,194 | 1967 µs | 8057 µs | 13124 µs |
+| A | fsync per write | Redis | **8,889** | 903 µs | 2058 µs | 5150 µs |
+| A | none | lsmrs | **187,362** | 29 µs | 105 µs | 183 µs |
+| A | none | Redis | 124,507 | 60 µs | 111 µs | 170 µs |
+| C | none | lsmrs | **270,485** | 21 µs | 73 µs | 138 µs |
+| C | none | Redis | 130,696 | 58 µs | 97 µs | 136 µs |
+
+**fsync costs 45×.** 4,194 ops/sec with WAL fsync per write against 187,362
+without. Nothing else in this project comes within an order of magnitude of
+that factor — bloom filters, the largest in-process win, were 20–52× on a path
+already measured in microseconds.
+
+**Redis is 2.1× faster at equal durability, and the reason is specific.** It is
+single-threaded and still wins, so this is not about cores: Redis *group
+commits*, fsyncing its AOF once per event-loop iteration so N concurrent
+writers share one disk round-trip. lsmrs fsyncs inside `put` while holding the
+global write lock, so N writers cost N serialised fsyncs. That is the single
+largest piece of known work left.
+
+**Where lsmrs is ahead, it is arithmetic.** 1.5× on mixed and 2.1× read-only,
+running 8 client threads on 16 cores against Redis's one. Per core Redis is
+several times further ahead. Tail latencies land close when neither is fsyncing
+(183 µs vs 170 µs at p99.9) and Redis pulls clearly ahead when both are
+(5150 µs vs 13124 µs) — again group commit, which bounds how long a writer can
+be stuck behind others.
+
+Reproduce:
+
+```bash
+cargo run --release -- serve 127.0.0.1:7379 --no-sync
+cargo run --release --bin ycsb -- --addr 127.0.0.1:7379 --workload a
+```
+
+`ycsb` takes `--workload a|b|c`, `--records`, `--ops`, `--threads`, and
+`--distribution zipfian|uniform`, and speaks RESP — so it drives a real
+`redis-server` unchanged.
+
+### Bloom filters
+
+Phase 4, measured against the phase-3 read path (10k keys, ~13 SSTables):
+
+| operation | before | after |
+|---|---:|---:|
+| miss, overlapping key ranges | 63.9 µs | 1.22 µs |
+| miss, disjoint ranges | 5.13 µs | 250 ns |
+
+---
+
 ## Quick start
 
 ```bash
@@ -148,45 +204,6 @@ the next begins.
       usable from `redis-cli`.
 - [x] **Phase 7 — Polish & benchmark:** YCSB-style workload, latency histograms
       (p50/p95/p99), comparison notes.
-
----
-
-## Benchmarks
-
-Bloom filters, measured against the phase-3 read path (10k keys, ~13 SSTables):
-
-| operation | before | after |
-|---|---|---|
-| miss, overlapping key ranges | 63.9 µs | 1.22 µs |
-| miss, disjoint ranges | 5.13 µs | 250 ns |
-
-YCSB-style, 20k records / 40k operations / 8 threads / Zipfian keys, against a
-real `redis-server` on the same 16-core machine:
-
-| server | durability | ops/sec | read p50 | read p99.9 |
-|---|---|---|---|---|
-| lsmrs | fsync per write | 4,011 | 2031 µs | 12689 µs |
-| redis | `appendfsync always` | 9,427 | 876 µs | 3697 µs |
-| lsmrs | none | 172,971 | 30 µs | 358 µs |
-| redis | no AOF | 123,934 | 60 µs | 178 µs |
-
-Three things worth reading off that table:
-
-- **fsync costs 43x.** Nothing else in this project comes close to that factor.
-- **Redis wins at equal durability**, while single-threaded, because it
-  *group-commits*: N concurrent writers share one disk round-trip. lsmrs fsyncs
-  per write under a global lock, so N writers cost N fsyncs. That is the
-  single largest piece of known work left.
-- **Redis has tighter tails** — no lock contention, no background compaction.
-  The LSM design trades tail latency for write throughput, and this is that
-  trade, measured.
-
-Reproduce with:
-
-```bash
-cargo run --release -- serve 127.0.0.1:7379 --no-sync
-cargo run --release --bin ycsb -- --addr 127.0.0.1:7379 --workload a
-```
 
 ---
 

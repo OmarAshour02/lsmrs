@@ -360,18 +360,21 @@ points at lsmrs or at a real `redis-server`. Zipfian key distribution
 
 Workload A is 50% read / 50% update; workload C is read-only.
 
+All six configurations re-run back to back for consistency. Redis 7.0.15,
+i7-13620H (16 threads), Linux 6.17, rustc 1.97.
+
 | server | durability | workload | ops/sec | read p50 | read p99 | read p99.9 |
 |---|---|---|---|---|---|---|
-| lsmrs | fsync per write | A | 4,011 | 2031 us | 8651 us | 12689 us |
-| redis | `appendfsync always` | A | 9,427 | 876 us | 1722 us | 3697 us |
-| lsmrs | none | A | 172,971 | 30 us | 118 us | 358 us |
-| redis | no AOF | A | 123,934 | 60 us | 117 us | 178 us |
-| lsmrs | none | C | 237,260 | 25 us | 92 us | 314 us |
-| redis | no AOF | C | 126,450 | 59 us | 106 us | 174 us |
+| lsmrs | fsync per write | A | 4,194 | 1967 us | 8057 us | 13124 us |
+| redis | `appendfsync always` | A | 8,889 | 903 us | 2058 us | 5150 us |
+| lsmrs | none | A | 187,362 | 29 us | 105 us | 183 us |
+| redis | no AOF | A | 124,507 | 60 us | 111 us | 170 us |
+| lsmrs | none | C | 270,485 | 21 us | 73 us | 138 us |
+| redis | no AOF | C | 130,696 | 58 us | 97 us | 136 us |
 
-### fsync is the whole story, 43x of it
+### fsync is the whole story, 45x of it
 
-Turning off WAL fsync takes lsmrs from 4,011 to 172,971 ops/sec. Nothing else
+Turning off WAL fsync takes lsmrs from 4,194 to 187,362 ops/sec. Nothing else
 measured in this project comes close to that factor -- bloom filters were 20-52x
 on a miss path that was itself microseconds. A single disk round-trip per write
 dwarfs every in-process optimisation.
@@ -379,10 +382,10 @@ dwarfs every in-process optimisation.
 It is also why the earlier phase benchmarks used `sync: false`: with fsync on,
 they would have measured the disk and nothing else.
 
-### Redis is 2.3x faster at equal durability, and the reason is a real gap
+### Redis is 2.1x faster at equal durability, and the reason is a real gap
 
-`appendfsync always` is Redis's comparable setting, and it beats us 9,427 to
-4,011. Redis is *single-threaded* and still wins, so this is not about cores.
+`appendfsync always` is Redis's comparable setting, and it beats us 8,889 to
+4,194. Redis is *single-threaded* and still wins, so this is not about cores.
 
 The difference is **group commit**. Redis appends every command to its AOF
 buffer and fsyncs once per event-loop iteration, so eight clients writing
@@ -398,28 +401,35 @@ and it is what every real WAL does.
 
 ### Where lsmrs wins, and why it doesn't count for much
 
-Without fsync we beat Redis 1.4x on the mixed workload and 1.9x read-only. That
+Without fsync we beat Redis 1.5x on the mixed workload and 2.1x read-only. That
 is 8 client threads on 16 cores against Redis's single thread. Per core, Redis
 is several times ahead. A thread-per-connection server outrunning a
 single-threaded one on a 16-core box is arithmetic, not engineering.
 
-### Redis has better tails, and that is engineering
+### Tail latency: a claim that did not survive a careful re-run
 
-At p99.9 on workload A without fsync: Redis 178us, lsmrs 358us. Redis is
-*tighter* while being slower at the median. Two reasons, both structural:
+An early single run showed Redis at 178us p99.9 against our 358us without
+fsync, and the conclusion drawn was that Redis has structurally tighter tails
+because it has no lock contention and no compactor.
 
-- **No lock contention.** One thread means no writer ever waits for a reader.
-  Our `RwLock<Db>` serialises every `SET` globally, so a write arriving behind
-  seven others waits for all of them.
-- **No background compaction.** Our compactor competes for disk and CPU with
-  live traffic and takes the write lock to publish. Redis has no equivalent.
+Re-running all six configurations back to back does not support that. Without
+fsync the tails are close -- 183us against 170us at p99.9, and at p99 lsmrs is
+actually *ahead* (105us vs 111us). The original 358us was run-to-run noise
+being read as a finding.
 
-The LSM design trades tail latency for write throughput. This is that trade,
-measured.
+Where Redis's tail advantage is real is *with* fsync: 5150us against our
+13124us at p99.9. That is the same group-commit story as the throughput gap.
+Under group commit a writer waits for at most one batch; under our
+fsync-per-write-under-a-global-lock, a writer waits for every writer ahead of
+it, so the worst case grows with concurrency.
+
+The lesson is about method, not about Redis: one run of a latency benchmark is
+an anecdote, and the tail is exactly where that bites. Throughput numbers were
+stable to within a few percent across runs; p99.9 moved by 2x.
 
 ### What the read-only number says
 
-237k ops/sec on workload C, against 173k on A, isolates the write lock: removing
-writes entirely is worth 37%. That gap is the cost of `RwLock<Db>` -- readers
+270k ops/sec on workload C, against 187k on A, isolates the write lock:
+removing writes entirely is worth 44%. That gap is the cost of `RwLock<Db>` -- readers
 queueing behind exclusive writers -- and it is the second thing worth fixing
 after group commit.
